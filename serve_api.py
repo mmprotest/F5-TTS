@@ -1,17 +1,17 @@
 """Simple FastAPI server for F5-TTS inference.
 
-This script exposes a HTTP endpoint that accepts reference audio, reference
-text, and target text for speech generation. Responses include the generated
-audio encoded as base64 alongside metadata such as the sample rate and random
-seed that was used.
+This script exposes a HTTP endpoint that accepts only the text to be generated.
+The reference audio (``.mp3`` by default) and the corresponding reference text
+are provided at server start-up, allowing the server to reuse them for every
+request. Responses include the generated audio encoded as base64 alongside
+metadata such as the sample rate and random seed that was used.
 
 Example usage::
 
-    python serve_api.py --host 0.0.0.0 --port 8000
+    python serve_api.py --reference-audio ./ref.mp3 --reference-text ./ref.txt
 
-Once running, send a POST request to ``/infer`` with ``multipart/form-data``
-fields ``reference_audio`` (file upload), ``reference_text`` (string), and
-``target_text`` (string).
+Once running, send a POST request to ``/infer`` with a JSON body containing the
+field ``text`` representing the utterance to synthesize.
 """
 
 from __future__ import annotations
@@ -19,26 +19,15 @@ from __future__ import annotations
 import argparse
 import base64
 import io
-import os
-import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from f5_tts.api import F5TTS
-
-
-def _write_temp_file(filename: Optional[str], data: bytes) -> Path:
-    """Persist an uploaded file to a temporary location."""
-
-    suffix = Path(filename or "reference.wav").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp_path = Path(tmp.name)
-    return tmp_path
 
 
 def _encode_wav(wav, sample_rate: int) -> str:
@@ -52,6 +41,12 @@ def _encode_wav(wav, sample_rate: int) -> str:
     return base64.b64encode(buffer.read()).decode("utf-8")
 
 
+class InferenceRequest(BaseModel):
+    """Payload for text-to-speech inference requests."""
+
+    text: str
+
+
 def build_app(
     model: str = "F5TTS_v1_Base",
     ckpt_file: str = "",
@@ -61,6 +56,8 @@ def build_app(
     vocoder_local_path: Optional[str] = None,
     device: Optional[str] = None,
     hf_cache_dir: Optional[str] = None,
+    reference_audio_path: Path | str = Path("ref.mp3"),
+    reference_text: str = "",
 ) -> FastAPI:
     """Create a FastAPI application configured for inference."""
 
@@ -83,31 +80,27 @@ def build_app(
     async def health() -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
+    reference_audio_path = Path(reference_audio_path)
+
+    if not reference_audio_path.exists():
+        raise FileNotFoundError(
+            f"Reference audio file '{reference_audio_path}' does not exist"
+        )
+
+    if not reference_text:
+        raise ValueError("Reference text must not be empty")
+
     @app.post("/infer")
-    async def infer(
-        reference_audio: UploadFile = File(...),
-        reference_text: str = Form(...),
-        target_text: str = Form(...),
-        seed: Optional[int] = Form(None),
-        remove_silence: bool = Form(False),
-    ) -> JSONResponse:
+    async def infer(request: InferenceRequest) -> JSONResponse:
         model_instance = get_model()
 
-        file_bytes = await reference_audio.read()
-
-        temp_file: Optional[Path] = None
-        try:
-            temp_file = _write_temp_file(reference_audio.filename, file_bytes)
-            wav, sample_rate, _ = model_instance.infer(
-                ref_file=str(temp_file),
-                ref_text=reference_text,
-                gen_text=target_text,
-                remove_silence=remove_silence,
-                seed=seed,
-            )
-        finally:
-            if temp_file and temp_file.exists():
-                os.unlink(temp_file)
+        wav, sample_rate, _ = model_instance.infer(
+            ref_file=str(reference_audio_path),
+            ref_text=reference_text,
+            gen_text=request.text,
+            remove_silence=False,
+            seed=None,
+        )
 
         encoded_wav = _encode_wav(wav, sample_rate)
 
@@ -122,6 +115,13 @@ def build_app(
     return app
 
 
+def _load_reference_text(path: Path | str) -> str:
+    """Read and normalize the reference transcript."""
+
+    text = Path(path).read_text(encoding="utf-8")
+    return text.strip()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the F5-TTS inference API server")
     parser.add_argument("--host", default="127.0.0.1", help="Host address to bind the server")
@@ -134,6 +134,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocoder-local-path", default=None, help="Local path to vocoder weights")
     parser.add_argument("--device", default=None, help="Device to run inference on")
     parser.add_argument("--hf-cache-dir", default=None, help="Hugging Face cache directory")
+    parser.add_argument(
+        "--reference-audio",
+        required=True,
+        help="Path to the reference audio file (e.g., an .mp3 recording)",
+    )
+    parser.add_argument(
+        "--reference-text",
+        required=True,
+        help="Path to a text file containing the reference transcript",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +159,8 @@ def main() -> None:
         vocoder_local_path=args.vocoder_local_path,
         device=args.device,
         hf_cache_dir=args.hf_cache_dir,
+        reference_audio_path=Path(args.reference_audio),
+        reference_text=_load_reference_text(args.reference_text),
     )
 
     import uvicorn
